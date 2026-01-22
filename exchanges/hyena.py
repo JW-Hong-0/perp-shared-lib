@@ -119,6 +119,8 @@ class HyenaExchange(AbstractExchange):
         if not self.wallet_address:
             self.wallet_address = self._account.address
         if not self.main_address or not self._is_valid_address(self.main_address):
+            if self.main_address:
+                logger.warning("Hyena main_address invalid; falling back to wallet address.")
             self.main_address = self.wallet_address
 
         base_url = self.base_url or hl_constants.MAINNET_API_URL
