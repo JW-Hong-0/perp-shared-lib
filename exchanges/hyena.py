@@ -1,4 +1,6 @@
 import logging
+import os
+import sys
 import time
 from typing import Dict, List, Optional, Any
 
@@ -15,6 +17,10 @@ from ..models import (
     Position,
     Ticker,
 )
+
+sdk_path = os.getenv("HYPERLIQUID_SDK_PATH")
+if sdk_path and sdk_path not in sys.path:
+    sys.path.insert(0, sdk_path)
 
 try:
     from hyperliquid.info import Info
