@@ -47,7 +47,11 @@ class HyenaExchange(AbstractExchange):
         cfg = config or {}
         self.private_key = cfg.get("private_key")
         self.wallet_address = cfg.get("wallet_address")
-        self.main_address = cfg.get("main_address") or os.getenv("HYPERLIQUID_MAIN_ADDRESS")
+        self.main_address = (
+            cfg.get("main_address")
+            or os.getenv("HYPERLIQUID_MAIN_ADDRESS")
+            or os.getenv("HYPERLIQUID_API_WALLET_ADDRESS")
+        )
         self.dex_id = (cfg.get("dex_id") or "hyna").lower()
         self.use_symbol_prefix = bool(cfg.get("use_symbol_prefix", True))
         self.builder_address = cfg.get(
@@ -64,8 +68,19 @@ class HyenaExchange(AbstractExchange):
         self._account = None
         self._markets_loaded_at = 0.0
 
+    @staticmethod
+    def _is_valid_address(addr: Optional[str]) -> bool:
+        if not addr:
+            return False
+        addr = addr.strip()
+        return addr.startswith("0x") and len(addr) == 42
+
     def _state_address(self) -> str:
-        return self.main_address or self.wallet_address or ""
+        if self._is_valid_address(self.main_address):
+            return self.main_address
+        if self._is_valid_address(self.wallet_address):
+            return self.wallet_address
+        return ""
 
     def _ensure_symbol(self, symbol: str) -> str:
         sym = symbol or ""
@@ -94,7 +109,7 @@ class HyenaExchange(AbstractExchange):
         self._account = Account.from_key(self.private_key)
         if not self.wallet_address:
             self.wallet_address = self._account.address
-        if not self.main_address:
+        if not self.main_address or not self._is_valid_address(self.main_address):
             self.main_address = self.wallet_address
 
         base_url = self.base_url or hl_constants.MAINNET_API_URL
