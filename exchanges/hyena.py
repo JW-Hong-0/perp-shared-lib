@@ -233,12 +233,21 @@ class HyenaExchange(AbstractExchange):
         address = self._state_address()
         if not self.info or not address:
             raise ExchangeError("Hyena not initialized.")
-        state = self.info.user_state(address, dex=self.dex_id)
-        margin = state.get("marginSummary", {})
-        total = float(margin.get("accountValue", 0.0))
-        free = float(margin.get("withdrawable", 0.0))
-        used = max(total - free, 0.0)
-        return {"USDe": Balance(currency="USDe", total=total, free=free, used=used)}
+        retries = int(self.config.get("balance_retries", 2))
+        delay_s = float(self.config.get("balance_retry_delay_s", 2.0))
+        last = {"total": 0.0, "free": 0.0, "used": 0.0}
+        for attempt in range(retries + 1):
+            state = self.info.user_state(address, dex=self.dex_id)
+            margin = state.get("marginSummary", {}) or {}
+            cross = state.get("crossMarginSummary", {}) or {}
+            total = float(margin.get("accountValue", 0.0) or cross.get("accountValue", 0.0) or 0.0)
+            free = float(margin.get("withdrawable", 0.0) or cross.get("withdrawable", 0.0) or 0.0)
+            used = max(total - free, 0.0)
+            last = {"total": total, "free": free, "used": used}
+            if total > 0 or attempt == retries:
+                break
+            await asyncio.sleep(delay_s)
+        return {"USDe": Balance(currency="USDe", total=last["total"], free=last["free"], used=last["used"])}
 
     async def fetch_positions(self) -> List[Position]:
         address = self._state_address()
