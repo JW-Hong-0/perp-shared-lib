@@ -296,17 +296,14 @@ class HyenaExchange(AbstractExchange):
 
         order_type = type.value if isinstance(type, OrderType) else str(type)
         if order_type == OrderType.MARKET.value:
-            mids = self.info.all_mids(dex=self.dex_id)
-            px = float(mids.get(sym, 0.0))
-            limit_px = self._limit_price(sym, is_buy, px)
-            order_req = {
-                "coin": sym,
-                "is_buy": is_buy,
-                "sz": qty,
-                "limit_px": limit_px,
-                "order_type": {"limit": {"tif": "Ioc"}},
-                "reduce_only": bool(params.get("reduce_only", False)),
-            }
+            res = self.exchange.market_open(
+                sym,
+                is_buy,
+                qty,
+                px=None,
+                slippage=self.slippage,
+                builder={"b": self.builder_address.lower(), "f": self.builder_fee},
+            )
         else:
             if price is None:
                 raise ExchangeError("Hyena limit order requires price.")
@@ -319,10 +316,11 @@ class HyenaExchange(AbstractExchange):
                 "reduce_only": bool(params.get("reduce_only", False)),
             }
 
-        res = self.exchange.bulk_orders(
-            [order_req],
-            builder={"b": self.builder_address.lower(), "f": self.builder_fee},
-        )
+        if order_type != OrderType.MARKET.value:
+            res = self.exchange.bulk_orders(
+                [order_req],
+                builder={"b": self.builder_address.lower(), "f": self.builder_fee},
+            )
 
         status = OrderStatus.OPEN
         order_id = ""
