@@ -47,6 +47,7 @@ class HyenaExchange(AbstractExchange):
         cfg = config or {}
         self.private_key = cfg.get("private_key")
         self.wallet_address = cfg.get("wallet_address")
+        self.main_address = cfg.get("main_address") or os.getenv("HYPERLIQUID_MAIN_ADDRESS")
         self.dex_id = (cfg.get("dex_id") or "hyna").lower()
         self.use_symbol_prefix = bool(cfg.get("use_symbol_prefix", True))
         self.builder_address = cfg.get(
@@ -62,6 +63,9 @@ class HyenaExchange(AbstractExchange):
         self.exchange: Optional[HLExchange] = None
         self._account = None
         self._markets_loaded_at = 0.0
+
+    def _state_address(self) -> str:
+        return self.main_address or self.wallet_address or ""
 
     def _ensure_symbol(self, symbol: str) -> str:
         sym = symbol or ""
@@ -90,6 +94,8 @@ class HyenaExchange(AbstractExchange):
         self._account = Account.from_key(self.private_key)
         if not self.wallet_address:
             self.wallet_address = self._account.address
+        if not self.main_address:
+            self.main_address = self.wallet_address
 
         base_url = self.base_url or hl_constants.MAINNET_API_URL
         self.info = Info(base_url, skip_ws=True, perp_dexs=[self.dex_id])
@@ -189,19 +195,21 @@ class HyenaExchange(AbstractExchange):
         pass
 
     async def fetch_balance(self) -> Dict[str, Balance]:
-        if not self.info or not self.wallet_address:
+        address = self._state_address()
+        if not self.info or not address:
             raise ExchangeError("Hyena not initialized.")
-        state = self.info.user_state(self.wallet_address, dex=self.dex_id)
+        state = self.info.user_state(address, dex=self.dex_id)
         margin = state.get("marginSummary", {})
         total = float(margin.get("accountValue", 0.0))
         free = float(margin.get("withdrawable", 0.0))
         used = max(total - free, 0.0)
-        return {"USDC": Balance(currency="USDC", total=total, free=free, used=used)}
+        return {"USDe": Balance(currency="USDe", total=total, free=free, used=used)}
 
     async def fetch_positions(self) -> List[Position]:
-        if not self.info or not self.wallet_address:
+        address = self._state_address()
+        if not self.info or not address:
             raise ExchangeError("Hyena not initialized.")
-        state = self.info.user_state(self.wallet_address, dex=self.dex_id)
+        state = self.info.user_state(address, dex=self.dex_id)
         positions: List[Position] = []
         for item in state.get("assetPositions", []):
             pos = item.get("position", {})
@@ -321,6 +329,8 @@ class HyenaExchange(AbstractExchange):
                     status = OrderStatus.OPEN
                 elif "error" in first:
                     status = OrderStatus.REJECTED
+                    err = first.get("error")
+                    logger.warning(f"Hyena order rejected: {err}")
         else:
             status = OrderStatus.REJECTED
 
