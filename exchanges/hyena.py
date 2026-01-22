@@ -67,6 +67,7 @@ class HyenaExchange(AbstractExchange):
         self.exchange: Optional[HLExchange] = None
         self._account = None
         self._markets_loaded_at = 0.0
+        self._trade_address = ""
 
     @staticmethod
     def _is_valid_address(addr: Optional[str]) -> bool:
@@ -124,12 +125,18 @@ class HyenaExchange(AbstractExchange):
             self.main_address = self.wallet_address
 
         base_url = self.base_url or hl_constants.MAINNET_API_URL
+        self._trade_address = (
+            self.main_address if self._is_valid_address(self.main_address) else None
+        )
         self.info = Info(base_url, skip_ws=True, perp_dexs=[self.dex_id])
         self.exchange = HLExchange(
             self._account,
             base_url,
             perp_dexs=[self.dex_id],
+            account_address=self._trade_address,
         )
+        if self._trade_address:
+            logger.info(f"Hyena trade account set to {self._trade_address}")
 
         if self.approve_builder_fee:
             try:
