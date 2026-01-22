@@ -84,6 +84,15 @@ class HyenaExchange(AbstractExchange):
 
     def _ensure_symbol(self, symbol: str) -> str:
         sym = symbol or ""
+        if self.markets:
+            if sym in self.markets:
+                return sym
+            stripped = self._strip_prefix(sym)
+            if stripped in self.markets:
+                return stripped
+            pref = f"{self.dex_id}:{stripped}"
+            if pref in self.markets:
+                return pref
         if not self.use_symbol_prefix:
             return sym
         if ":" in sym:
