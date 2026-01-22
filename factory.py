@@ -5,12 +5,14 @@ from typing import Dict, Any, Optional
 # Note: Using relative imports
 from .exchanges.grvt import GrvtExchange
 from .exchanges.lighter import LighterExchange
+from .exchanges.hyena import HyenaExchange
 from .exchanges.variational import VariationalExchange
 from .base import AbstractExchange as ExchangeBase
 
 class ExchangeType(Enum):
     GRVT = "GRVT"
     LIGHTER = "LIGHTER"
+    HYENA = "HYENA"
     VARIATIONAL = "VARIATIONAL"
 
 class ExchangeFactory:
@@ -33,6 +35,8 @@ class ExchangeFactory:
             return GrvtExchange(config)
         elif exchange_type == ExchangeType.LIGHTER:
             return LighterExchange(config)
+        elif exchange_type == ExchangeType.HYENA:
+            return HyenaExchange(config)
         elif exchange_type == ExchangeType.VARIATIONAL:
             return VariationalExchange(config)
         else:
