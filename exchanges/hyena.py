@@ -117,7 +117,9 @@ class HyenaExchange(AbstractExchange):
             raise ExchangeError("Hyena private_key missing.")
 
         self._account = Account.from_key(self.private_key)
-        if not self.wallet_address:
+        if not self.wallet_address or not self._is_valid_address(self.wallet_address):
+            if self.wallet_address:
+                logger.warning("Hyena wallet_address invalid; using private key address.")
             self.wallet_address = self._account.address
         if not self.main_address or not self._is_valid_address(self.main_address):
             if self.main_address:
