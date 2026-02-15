@@ -47,6 +47,16 @@ class LighterExchange(AbstractExchange):
         self.funding_interval_s = 3600
         self._error_cooldown_until = 0.0
         self._error_cooldown_reason = ""
+        self._auth_lock = asyncio.Lock()
+        self._auth_last_ts = 0.0
+        try:
+            self._auth_ttl_s = float(os.getenv("LIGHTER_AUTH_TTL_S", "14400"))
+        except Exception:
+            self._auth_ttl_s = 14400.0
+        try:
+            self._auth_refresh_s = float(os.getenv("LIGHTER_AUTH_REFRESH_S", "600"))
+        except Exception:
+            self._auth_refresh_s = 600.0
         try:
             self._error_cooldown_s = float(os.getenv("LIGHTER_ERROR_COOLDOWN_S", "120"))
         except Exception:
@@ -477,7 +487,7 @@ class LighterExchange(AbstractExchange):
         if not self.client:
             return False
         try:
-            auth_res = self.client.create_auth_token_with_expiry()
+            auth_res = self.client.create_auth_token_with_expiry(int(self._auth_ttl_s))
             token = auth_res[0] if isinstance(auth_res, tuple) and len(auth_res) > 1 and not auth_res[1] else None
             if not token:
                 if isinstance(auth_res, str):
@@ -492,11 +502,32 @@ class LighterExchange(AbstractExchange):
             if self.client.api_client and self.client.api_client.configuration:
                 self.client.api_client.configuration.api_key['Authorization'] = token
                 self.client.api_client.configuration.access_token = token
-            logger.warning("Lighter auth refreshed (%s).", reason)
+                try:
+                    self.client.api_client.default_headers["Authorization"] = token
+                except Exception:
+                    pass
+            self._auth_last_ts = time.time()
+            logger.warning(
+                "Lighter auth refreshed (%s). auth_ttl_s=%s refresh_s=%s",
+                reason,
+                int(self._auth_ttl_s),
+                int(self._auth_refresh_s),
+            )
             return True
         except Exception as e:
             logger.warning("Lighter auth refresh failed (%s): %s", reason, e)
             return False
+
+    async def _ensure_auth_token(self, context: str) -> bool:
+        now = time.time()
+        if not self.auth_token or (self._auth_refresh_s > 0 and (now - self._auth_last_ts) >= self._auth_refresh_s):
+            async with self._auth_lock:
+                # Double-check inside lock
+                now = time.time()
+                if not self.auth_token or (self._auth_refresh_s > 0 and (now - self._auth_last_ts) >= self._auth_refresh_s):
+                    ok = await self._refresh_auth_token(context)
+                    return ok
+        return True
 
     async def _handle_lighter_error(self, err, context: str) -> None:
         if self._is_auth_error(err):
@@ -509,11 +540,19 @@ class LighterExchange(AbstractExchange):
         self._maybe_set_error_cooldown(err, context)
 
     async def create_order(self, symbol, type, side, amount, price=None, params={}) -> Order:
+        retry_count = 0
+        try:
+            retry_count = int(params.get("_auth_retry", 0))
+        except Exception:
+            retry_count = 0
         remaining = self._cooldown_remaining()
         if remaining > 0:
             raise ExchangeError(
                 f"Lighter cooldown active ({remaining:.0f}s) reason={self._error_cooldown_reason}"
             )
+        # Proactive auth refresh to reduce 401s
+        if not await self._ensure_auth_token("create_order"):
+            raise ExchangeError("Lighter auth refresh failed before create_order")
         market_id = self.markets_map.get(symbol)
         if market_id is None:
              # Try fallback
@@ -563,26 +602,43 @@ class LighterExchange(AbstractExchange):
                         max_slippage = float(self.config.get("slippage", max_slippage))
                     except Exception:
                         pass
-                res = await self.client.create_market_order_limited_slippage(
-                    market_index=market_id,
-                    client_order_index=client_order_index,
-                    base_amount=amount_int,
-                    max_slippage=max_slippage,
-                    is_ask=is_ask,
-                )
+                async def _market_once():
+                    return await self.client.create_market_order_limited_slippage(
+                        market_index=market_id,
+                        client_order_index=client_order_index,
+                        base_amount=amount_int,
+                        max_slippage=max_slippage,
+                        is_ask=is_ask,
+                    )
+                res = await _market_once()
                 order_id = "unknown"
                 client_order_id = str(client_order_index)
                 predicted_ms = None
-                if isinstance(res, tuple):
-                    tx = res[0]
-                    resp = res[1] if len(res) > 1 else None
+                def _parse_tuple(_res):
+                    nonlocal order_id, predicted_ms
+                    tx = _res[0]
+                    resp = _res[1] if len(_res) > 1 else None
                     if hasattr(tx, 'order_index'):
                         order_id = str(tx.order_index)
                     if hasattr(resp, 'predicted_execution_time_ms'):
                         predicted_ms = resp.predicted_execution_time_ms
+                if isinstance(res, tuple):
+                    _parse_tuple(res)
                 if len(res) > 2 and res[2]:
-                    await self._handle_lighter_error(res[2], "create_market")
-                    raise ExchangeError(f"Lighter Order Error: {res[2]}")
+                    err = res[2]
+                    if self._is_auth_error(err):
+                        await self._refresh_auth_token("create_market_retry")
+                        res = await _market_once()
+                        if isinstance(res, tuple):
+                            order_id = "unknown"
+                            predicted_ms = None
+                            _parse_tuple(res)
+                        if isinstance(res, tuple) and len(res) > 2 and res[2]:
+                            await self._handle_lighter_error(res[2], "create_market")
+                            raise ExchangeError(f"Lighter Order Error: {res[2]}")
+                    else:
+                        await self._handle_lighter_error(err, "create_market")
+                        raise ExchangeError(f"Lighter Order Error: {err}")
                 elif isinstance(res, dict):
                     order_id = str(res.get('id') or res.get('order_id') or client_order_id)
 
@@ -661,7 +717,9 @@ class LighterExchange(AbstractExchange):
                 create_kwargs["order_expiry"] = getattr(self.client, "DEFAULT_IOC_EXPIRY", 0)
             # Do not set order_expiry explicitly; SDK default (-1) is accepted on mainnet.
 
-            res = await self.client.create_order(**create_kwargs)
+            async def _limit_once():
+                return await self.client.create_order(**create_kwargs)
+            res = await _limit_once()
             # Res: {'id': ..., 'status': ...}
             # SDK might return tuple (tx_hash, order_id_str, error) or dict?
             # Legacy code said: tx, tx_hash, err = await client.create_order(...)
@@ -675,15 +733,30 @@ class LighterExchange(AbstractExchange):
             predicted_ms = None
             if isinstance(res, tuple):
                 # res: (CreateOrder, RespSendTx, err)
-                tx = res[0]
-                resp = res[1] if len(res) > 1 else None
-                if hasattr(tx, 'order_index'):
-                    order_id = str(tx.order_index)
-                if hasattr(resp, 'predicted_execution_time_ms'):
-                    predicted_ms = resp.predicted_execution_time_ms
+                def _parse_tuple_limit(_res):
+                    nonlocal order_id, predicted_ms
+                    tx = _res[0]
+                    resp = _res[1] if len(_res) > 1 else None
+                    if hasattr(tx, 'order_index'):
+                        order_id = str(tx.order_index)
+                    if hasattr(resp, 'predicted_execution_time_ms'):
+                        predicted_ms = resp.predicted_execution_time_ms
+                _parse_tuple_limit(res)
                 if len(res) > 2 and res[2]:
-                    await self._handle_lighter_error(res[2], "create_limit")
-                    raise ExchangeError(f"Lighter Order Error: {res[2]}")
+                    err = res[2]
+                    if self._is_auth_error(err):
+                        await self._refresh_auth_token("create_limit_retry")
+                        res = await _limit_once()
+                        if isinstance(res, tuple):
+                            order_id = "unknown"
+                            predicted_ms = None
+                            _parse_tuple_limit(res)
+                        if isinstance(res, tuple) and len(res) > 2 and res[2]:
+                            await self._handle_lighter_error(res[2], "create_limit")
+                            raise ExchangeError(f"Lighter Order Error: {res[2]}")
+                    else:
+                        await self._handle_lighter_error(err, "create_limit")
+                        raise ExchangeError(f"Lighter Order Error: {err}")
             elif isinstance(res, dict):
                 order_id = str(res.get('id') or res.get('order_id') or client_order_id)
 
@@ -711,6 +784,12 @@ class LighterExchange(AbstractExchange):
             )
 
         except Exception as e:
+            if self._is_auth_error(e) and retry_count < 1:
+                await self._refresh_auth_token("create_order_retry")
+                # One retry after auth refresh
+                new_params = dict(params or {})
+                new_params["_auth_retry"] = retry_count + 1
+                return await self.create_order(symbol, type, side, amount, price, new_params)
             await self._handle_lighter_error(e, "create_order")
             raise ExchangeError(f"Lighter Order Failed: {e}")
 

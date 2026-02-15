@@ -63,6 +63,7 @@ class HyenaExchange(AbstractExchange):
         self.builder_max_fee_rate = str(cfg.get("builder_max_fee_rate", "0"))
         self.slippage = float(cfg.get("slippage", 0.05))
         self.base_url = cfg.get("base_url")
+        self.min_notional = float(cfg.get("min_notional", 10.0))
 
         self.info: Optional[Info] = None
         self.exchange: Optional[HLExchange] = None
@@ -110,6 +111,21 @@ class HyenaExchange(AbstractExchange):
         now = int(time.time())
         next_hour = (now // 3600 + 1) * 3600
         return next_hour * 1000
+
+    @staticmethod
+    def _parse_next_funding_ms(ctx: Dict[str, Any]) -> int:
+        for key in ("fundingNextTime", "nextFundingTime", "nextFundingTimeMs"):
+            val = ctx.get(key)
+            if val is None:
+                continue
+            try:
+                val_i = int(val)
+                if val_i > 10_000_000_000:
+                    return val_i
+                return val_i * 1000
+            except Exception:
+                continue
+        return 0
 
     async def initialize(self):
         if not Info or not HLExchange or not Account:
@@ -177,6 +193,8 @@ class HyenaExchange(AbstractExchange):
                     qty_step=min_qty,
                     price_tick=0.0,
                 )
+                m.min_notional = self.min_notional
+                m.funding_interval_s = 3600
                 if "maxLeverage" in asset:
                     try:
                         m.max_leverage = float(asset.get("maxLeverage"))
@@ -204,6 +222,7 @@ class HyenaExchange(AbstractExchange):
     async def fetch_funding_rate(self, symbol: str) -> FundingRate:
         sym = self._ensure_symbol(symbol)
         rate = 0.0
+        next_ms = 0
         try:
             if self.info:
                 data = self.info.post(
@@ -215,7 +234,9 @@ class HyenaExchange(AbstractExchange):
                     universe = meta.get("universe", [])
                     for idx, asset in enumerate(universe):
                         if asset.get("name") == sym and idx < len(ctxs):
-                            rate = float(ctxs[idx].get("funding", 0.0))
+                            ctx = ctxs[idx]
+                            rate = float(ctx.get("funding", 0.0))
+                            next_ms = self._parse_next_funding_ms(ctx)
                             break
         except Exception as e:
             logger.warning(f"Hyena funding_rate fetch failed: {e}")
@@ -223,7 +244,7 @@ class HyenaExchange(AbstractExchange):
             symbol=sym,
             rate=rate,
             predicted_rate=rate,
-            next_funding_time=self._next_funding_ms(),
+            next_funding_time=next_ms or self._next_funding_ms(),
         )
 
     async def subscribe_ticker(self, symbol: str, callback):
@@ -231,53 +252,155 @@ class HyenaExchange(AbstractExchange):
         pass
 
     async def fetch_balance(self) -> Dict[str, Balance]:
-        address = self._state_address()
-        if not self.info or not address:
+        if not self.info:
             raise ExchangeError("Hyena not initialized.")
+        address = self._state_address()
+        if not address:
+            raise ExchangeError("Hyena address missing.")
         retries = int(self.config.get("balance_retries", 2))
         delay_s = float(self.config.get("balance_retry_delay_s", 2.0))
-        last = {"total": 0.0, "free": 0.0, "used": 0.0}
-        for attempt in range(retries + 1):
-            state = self.info.user_state(address, dex=self.dex_id)
+        use_wallet_fallback = bool(self.config.get("use_wallet_state_fallback", True))
+        use_global_fallback = bool(self.config.get("use_global_state_fallback", True))
+        use_spot_fallback = bool(self.config.get("use_spot_state_fallback", True))
+
+        def _summarize(state: Dict[str, Any]) -> Dict[str, float]:
             margin = state.get("marginSummary", {}) or {}
             cross = state.get("crossMarginSummary", {}) or {}
-            total = float(margin.get("accountValue", 0.0) or cross.get("accountValue", 0.0) or 0.0)
-            free = float(margin.get("withdrawable", 0.0) or cross.get("withdrawable", 0.0) or 0.0)
+            total = float(
+                margin.get("accountValue", 0.0)
+                or cross.get("accountValue", 0.0)
+                or 0.0
+            )
+            free = float(
+                margin.get("withdrawable", 0.0)
+                or cross.get("withdrawable", 0.0)
+                or 0.0
+            )
             used = max(total - free, 0.0)
-            last = {"total": total, "free": free, "used": used}
-            if total > 0 or attempt == retries:
+            return {"total": total, "free": free, "used": used}
+
+        def _state_for(addr: str, dex: Optional[str] = None) -> Dict[str, Any]:
+            if dex:
+                return self.info.user_state(addr, dex=dex)
+            return self.info.user_state(addr)
+
+        def _spot_usde(addr: str) -> Dict[str, float]:
+            spot = self.info.spot_user_state(addr)
+            balances = spot.get("balances", []) or []
+            total = 0.0
+            for bal in balances:
+                coin = str(bal.get("coin", "")).upper()
+                if coin == "USDE":
+                    total = float(bal.get("total", 0.0))
+                    break
+            return {"total": total, "free": total, "used": 0.0}
+
+        last = {"total": 0.0, "free": 0.0, "used": 0.0}
+        for attempt in range(retries + 1):
+            state = _state_for(address, self.dex_id)
+            last = _summarize(state)
+            if last["total"] > 0 or attempt == retries:
                 break
             await asyncio.sleep(delay_s)
-        return {"USDe": Balance(currency="USDe", total=last["total"], free=last["free"], used=last["used"])}
+
+        if last["total"] <= 0 and use_global_fallback:
+            global_state = _state_for(address, None)
+            global_bal = _summarize(global_state)
+            if global_bal["total"] > 0:
+                logger.info("Hyena balance fallback to global account state.")
+                last = global_bal
+
+        if last["total"] <= 0 and use_wallet_fallback and self._is_valid_address(self.wallet_address):
+            wallet_state = _state_for(self.wallet_address, self.dex_id)
+            wallet_bal = _summarize(wallet_state)
+            if wallet_bal["total"] > 0:
+                logger.info("Hyena balance fallback to wallet address state.")
+                last = wallet_bal
+            elif use_global_fallback:
+                wallet_global = _state_for(self.wallet_address, None)
+                wallet_global_bal = _summarize(wallet_global)
+                if wallet_global_bal["total"] > 0:
+                    logger.info("Hyena balance fallback to wallet global state.")
+                    last = wallet_global_bal
+
+        if last["total"] <= 0 and use_spot_fallback:
+            spot_bal = _spot_usde(address)
+            if spot_bal["total"] > 0:
+                logger.info("Hyena balance fallback to spot USDe on main address.")
+                last = spot_bal
+            elif self._is_valid_address(self.wallet_address):
+                wallet_spot = _spot_usde(self.wallet_address)
+                if wallet_spot["total"] > 0:
+                    logger.info("Hyena balance fallback to spot USDe on wallet address.")
+                    last = wallet_spot
+
+        return {
+            "USDe": Balance(
+                currency="USDe",
+                total=last["total"],
+                free=last["free"],
+                used=last["used"],
+            )
+        }
 
     async def fetch_positions(self) -> List[Position]:
-        address = self._state_address()
-        if not self.info or not address:
+        if not self.info:
             raise ExchangeError("Hyena not initialized.")
-        state = self.info.user_state(address, dex=self.dex_id)
-        positions: List[Position] = []
-        for item in state.get("assetPositions", []):
-            pos = item.get("position", {})
-            coin = pos.get("coin", "")
-            szi = float(pos.get("szi", 0.0))
-            if szi == 0:
-                continue
-            side = OrderSide.BUY if szi > 0 else OrderSide.SELL
-            leverage = 0.0
-            lev = pos.get("leverage") or {}
-            if isinstance(lev, dict):
-                leverage = float(lev.get("value", 0.0))
-            positions.append(
-                Position(
-                    symbol=coin,
-                    side=side,
-                    amount=abs(szi),
-                    entry_price=float(pos.get("entryPx", 0.0) or 0.0),
-                    unrealized_pnl=float(pos.get("unrealizedPnl", 0.0) or 0.0),
-                    leverage=leverage,
-                    liquidation_price=float(pos.get("liquidationPx", 0.0) or 0.0),
+        address = self._state_address()
+        if not address:
+            raise ExchangeError("Hyena address missing.")
+
+        def _parse_positions(state: Dict[str, Any]) -> List[Position]:
+            positions: List[Position] = []
+            for item in state.get("assetPositions", []):
+                pos = item.get("position", {})
+                coin = pos.get("coin", "")
+                szi = float(pos.get("szi", 0.0))
+                if szi == 0:
+                    continue
+                side = OrderSide.BUY if szi > 0 else OrderSide.SELL
+                leverage = 0.0
+                lev = pos.get("leverage") or {}
+                if isinstance(lev, dict):
+                    leverage = float(lev.get("value", 0.0))
+                positions.append(
+                    Position(
+                        symbol=coin,
+                        side=side,
+                        amount=abs(szi),
+                        entry_price=float(pos.get("entryPx", 0.0) or 0.0),
+                        unrealized_pnl=float(pos.get("unrealizedPnl", 0.0) or 0.0),
+                        leverage=leverage,
+                        liquidation_price=float(pos.get("liquidationPx", 0.0) or 0.0),
+                    )
                 )
-            )
+            return positions
+
+        state = self.info.user_state(address, dex=self.dex_id)
+        positions = _parse_positions(state)
+
+        use_global_fallback = bool(self.config.get("use_global_state_fallback", True))
+        if not positions and use_global_fallback:
+            global_state = self.info.user_state(address)
+            global_positions = _parse_positions(global_state)
+            if global_positions:
+                logger.info("Hyena positions fallback to global account state.")
+                positions = global_positions
+
+        use_wallet_fallback = bool(self.config.get("use_wallet_state_fallback", True))
+        if not positions and use_wallet_fallback and self._is_valid_address(self.wallet_address):
+            wallet_state = self.info.user_state(self.wallet_address, dex=self.dex_id)
+            wallet_positions = _parse_positions(wallet_state)
+            if wallet_positions:
+                logger.info("Hyena positions fallback to wallet address state.")
+                positions = wallet_positions
+            elif use_global_fallback:
+                wallet_global = self.info.user_state(self.wallet_address)
+                wallet_global_positions = _parse_positions(wallet_global)
+                if wallet_global_positions:
+                    logger.info("Hyena positions fallback to wallet global state.")
+                    positions = wallet_global_positions
+
         return positions
 
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
@@ -300,12 +423,22 @@ class HyenaExchange(AbstractExchange):
             return max(step, (qty // step) * step)
         return qty
 
+
     def _limit_price(self, symbol: str, is_buy: bool, px: float) -> float:
         if px <= 0:
             return px
         slippage = max(0.0, float(self.slippage))
         px = px * (1 + slippage) if is_buy else px * (1 - slippage)
         return float(f"{px:.5g}")
+
+    def _last_price(self, symbol: str) -> float:
+        if not self.info:
+            return 0.0
+        try:
+            mids = self.info.all_mids(dex=self.dex_id)
+            return float(mids.get(symbol, 0.0))
+        except Exception:
+            return 0.0
 
     async def create_order(
         self,
@@ -323,6 +456,17 @@ class HyenaExchange(AbstractExchange):
         qty = self._apply_qty_step(sym, amount)
         if qty <= 0:
             raise ExchangeError("Hyena order qty below min.")
+
+        reduce_only = bool(params.get("reduce_only", False))
+        price_check = float(price or 0.0)
+        if price_check <= 0:
+            price_check = self._last_price(sym)
+        if not reduce_only and price_check > 0 and self.min_notional > 0:
+            notional = qty * price_check
+            if notional < self.min_notional:
+                raise ExchangeError(
+                    f"Hyena order notional {notional:.4f} below min {self.min_notional}."
+                )
 
         order_type = type.value if isinstance(type, OrderType) else str(type)
         if order_type == OrderType.MARKET.value:
